@@ -382,10 +382,7 @@ impl<'p> Executor<'p> for &SqliteRwPool {
         (&self.write_pool).fetch_many(query)
     }
 
-    fn fetch_optional<'e, 'q, E>(
-        self,
-        query: E,
-    ) -> BoxFuture<'e, Result<Option<SqliteRow>, Error>>
+    fn fetch_optional<'e, 'q, E>(self, query: E) -> BoxFuture<'e, Result<Option<SqliteRow>, Error>>
     where
         'p: 'e,
         E: Execute<'q, Sqlite>,
@@ -444,4 +441,3 @@ impl<'a> Acquire<'a> for &SqliteRwPool {
         })
     }
 }
-
