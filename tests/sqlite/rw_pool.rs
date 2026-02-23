@@ -301,7 +301,7 @@ async fn rw_pool_concurrent_reads() -> anyhow::Result<()> {
     let mut handles = Vec::new();
     for _ in 0..4 {
         let pool = pool.clone();
-        handles.push(tokio::spawn(async move {
+        handles.push(sqlx_core::rt::spawn(async move {
             let rows = sqlx::query("SELECT count(*) as cnt FROM conc")
                 .fetch_one(&pool)
                 .await
@@ -311,7 +311,7 @@ async fn rw_pool_concurrent_reads() -> anyhow::Result<()> {
     }
 
     for handle in handles {
-        let count = handle.await?;
+        let count = handle.await;
         assert_eq!(count, 10);
     }
 
