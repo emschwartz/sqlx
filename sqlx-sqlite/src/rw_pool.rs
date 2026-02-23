@@ -4,7 +4,7 @@ use crate::{
 };
 
 use sqlx_core::acquire::Acquire;
-use sqlx_core::error::{BoxDynError, Error};
+use sqlx_core::error::Error;
 use sqlx_core::executor::{Execute, Executor};
 use sqlx_core::pool::{MaybePoolConnection, Pool, PoolConnection, PoolOptions};
 use sqlx_core::sql_str::SqlStr;
@@ -13,60 +13,8 @@ use sqlx_core::Either;
 
 use futures_core::future::BoxFuture;
 use futures_core::stream::BoxStream;
-use futures_util::TryStreamExt;
 
 use std::fmt;
-
-// ─── SQL Classification ────────────────────────────────────────────────────────
-
-/// Split `sql` into "words" (maximal runs of alphanumeric/underscore characters).
-fn sql_words(sql: &str) -> impl Iterator<Item = &str> {
-    sql.split(|c: char| !c.is_ascii_alphanumeric() && c != '_')
-        .filter(|w| !w.is_empty())
-}
-
-/// Check if any word in `sql` matches `keyword` (case-insensitive).
-fn has_keyword(sql: &str, keyword: &str) -> bool {
-    sql_words(sql).any(|w| w.eq_ignore_ascii_case(keyword))
-}
-
-/// Determines whether a SQL statement should be routed to the read pool.
-///
-/// Uses conservative heuristics — only definitively read-only statements
-/// return `true`. Everything ambiguous routes to the writer (safe default).
-///
-/// ## Routing rules
-///
-/// - `SELECT` / `EXPLAIN` → always reader (cannot write in SQLite)
-/// - `PRAGMA` without `=` → reader (read-only PRAGMA)
-/// - `WITH` CTE → reader **only if** no write keywords appear anywhere
-/// - Everything else → writer
-#[inline]
-pub(crate) fn is_read_only_sql(sql: &str) -> bool {
-    let first = match sql_words(sql).next() {
-        Some(w) => w,
-        None => return false,
-    };
-
-    if first.eq_ignore_ascii_case("SELECT") || first.eq_ignore_ascii_case("EXPLAIN") {
-        return true;
-    }
-
-    if first.eq_ignore_ascii_case("PRAGMA") && !sql.contains('=') {
-        return true;
-    }
-
-    // WITH CTEs: read-only if no write keywords appear anywhere.
-    // Safe false negatives: write keywords in string literals → routes to writer.
-    if first.eq_ignore_ascii_case("WITH") {
-        return !has_keyword(sql, "INSERT")
-            && !has_keyword(sql, "UPDATE")
-            && !has_keyword(sql, "DELETE")
-            && !has_keyword(sql, "REPLACE");
-    }
-
-    false
-}
 
 // ─── SqliteRwPoolOptions ───────────────────────────────────────────────────────
 
@@ -98,7 +46,6 @@ pub struct SqliteRwPoolOptions {
     writer_connect_options: Option<SqliteConnectOptions>,
     reader_pool_options: Option<PoolOptions<Sqlite>>,
     writer_pool_options: Option<PoolOptions<Sqlite>>,
-    auto_route: bool,
     checkpoint_on_close: bool,
 }
 
@@ -113,7 +60,6 @@ impl SqliteRwPoolOptions {
     ///
     /// Defaults:
     /// - `max_readers`: number of available CPUs (or 4 if unavailable)
-    /// - `auto_route`: `true`
     /// - `checkpoint_on_close`: `true`
     pub fn new() -> Self {
         Self {
@@ -122,7 +68,6 @@ impl SqliteRwPoolOptions {
             writer_connect_options: None,
             reader_pool_options: None,
             writer_pool_options: None,
-            auto_route: true,
             checkpoint_on_close: true,
         }
     }
@@ -165,16 +110,6 @@ impl SqliteRwPoolOptions {
     /// `max_connections` is always forced to 1 for the writer pool.
     pub fn writer_pool_options(mut self, opts: PoolOptions<Sqlite>) -> Self {
         self.writer_pool_options = Some(opts);
-        self
-    }
-
-    /// Enable or disable automatic SQL-based routing.
-    ///
-    /// When enabled (the default), the [`Executor`] impl inspects each query's SQL
-    /// to decide whether to use the reader or writer pool. When disabled, all
-    /// queries go to the writer; readers are only used via [`SqliteRwPool::reader()`].
-    pub fn auto_route(mut self, auto_route: bool) -> Self {
-        self.auto_route = auto_route;
         self
     }
 
@@ -244,7 +179,6 @@ impl SqliteRwPoolOptions {
         Ok(SqliteRwPool {
             read_pool,
             write_pool,
-            auto_route: self.auto_route,
             checkpoint_on_close: self.checkpoint_on_close,
         })
     }
@@ -261,14 +195,9 @@ impl SqliteRwPoolOptions {
 /// - A **writer pool** with a single connection for all write operations
 /// - A **reader pool** with multiple read-only connections for queries
 ///
-/// # Auto-Routing
-///
-/// When enabled (the default), the [`Executor`] impl inspects each query's SQL
-/// and routes it to the appropriate pool:
-///
-/// - `SELECT`, `EXPLAIN`, read-only `PRAGMA` → reader pool
-/// - `WITH` CTEs without write keywords → reader pool
-/// - Everything else → writer pool
+/// Use [`reader()`](SqliteRwPool::reader) and [`writer()`](SqliteRwPool::writer)
+/// to explicitly route queries to the appropriate pool. The [`Acquire`] trait
+/// and the [`Executor`] impl always use the writer pool as a safe default.
 ///
 /// # WAL Mode
 ///
@@ -292,14 +221,14 @@ impl SqliteRwPoolOptions {
 ///
 /// let pool = SqliteRwPool::connect("sqlite://data.db").await?;
 ///
-/// // SELECT → automatically routed to reader pool
+/// // Reads go through the reader pool
 /// let rows = sqlx::query("SELECT * FROM users")
-///     .fetch_all(&pool).await?;
+///     .fetch_all(pool.reader()).await?;
 ///
-/// // INSERT → automatically routed to writer pool
+/// // Writes go through the writer pool
 /// sqlx::query("INSERT INTO users (name) VALUES (?)")
 ///     .bind("Alice")
-///     .execute(&pool).await?;
+///     .execute(pool.writer()).await?;
 ///
 /// pool.close().await;
 /// # Ok(())
@@ -309,7 +238,6 @@ impl SqliteRwPoolOptions {
 pub struct SqliteRwPool {
     read_pool: Pool<Sqlite>,
     write_pool: Pool<Sqlite>,
-    auto_route: bool,
     checkpoint_on_close: bool,
 }
 
@@ -330,7 +258,8 @@ impl SqliteRwPool {
 
     /// Get a reference to the underlying reader pool.
     ///
-    /// Useful for explicitly routing queries to readers, bypassing auto-routing.
+    /// Use this to explicitly route read queries to the reader pool for
+    /// concurrent read access.
     ///
     /// # Note
     ///
@@ -428,7 +357,6 @@ impl fmt::Debug for SqliteRwPool {
         f.debug_struct("SqliteRwPool")
             .field("read_pool", &self.read_pool)
             .field("write_pool", &self.write_pool)
-            .field("auto_route", &self.auto_route)
             .field("checkpoint_on_close", &self.checkpoint_on_close)
             .finish()
     }
@@ -436,41 +364,14 @@ impl fmt::Debug for SqliteRwPool {
 
 // ─── Executor impl ─────────────────────────────────────────────────────────────
 
-/// Carries decomposed query parts for re-delegation to a connection's [`Executor`] impl.
-///
-/// This allows the `SqliteRwPool` to inspect the SQL for routing before delegating
-/// execution to the appropriate pool's connection, without coupling to
-/// `SqliteConnection` internals.
-struct RoutedQuery {
-    sql: SqlStr,
-    arguments: Option<crate::SqliteArguments>,
-    persistent: bool,
-}
-
-impl Execute<'_, Sqlite> for RoutedQuery {
-    fn sql(self) -> SqlStr {
-        self.sql
-    }
-
-    fn statement(&self) -> Option<&SqliteStatement> {
-        None
-    }
-
-    fn take_arguments(&mut self) -> Result<Option<crate::SqliteArguments>, BoxDynError> {
-        Ok(self.arguments.take())
-    }
-
-    fn persistent(&self) -> bool {
-        self.persistent
-    }
-}
-
+/// All queries executed directly on `&SqliteRwPool` go to the writer pool.
+/// Use [`SqliteRwPool::reader()`] to explicitly route reads to the reader pool.
 impl<'p> Executor<'p> for &SqliteRwPool {
     type Database = Sqlite;
 
     fn fetch_many<'e, 'q, E>(
         self,
-        mut query: E,
+        query: E,
     ) -> BoxStream<'e, Result<Either<SqliteQueryResult, SqliteRow>, Error>>
     where
         'p: 'e,
@@ -478,31 +379,12 @@ impl<'p> Executor<'p> for &SqliteRwPool {
         'q: 'e,
         E: 'q,
     {
-        let pool = self.clone();
-
-        Box::pin(try_stream! {
-            let arguments = query.take_arguments().map_err(Error::Encode)?;
-            let persistent = query.persistent();
-            let sql = query.sql();
-
-            let use_reader = pool.auto_route && is_read_only_sql(sql.as_str());
-            let target_pool = if use_reader { &pool.read_pool } else { &pool.write_pool };
-            let mut conn = target_pool.acquire().await?;
-
-            let routed = RoutedQuery { sql, arguments, persistent };
-            let mut s = conn.fetch_many(routed);
-
-            while let Some(v) = s.try_next().await? {
-                r#yield!(v);
-            }
-
-            Ok(())
-        })
+        (&self.write_pool).fetch_many(query)
     }
 
     fn fetch_optional<'e, 'q, E>(
         self,
-        mut query: E,
+        query: E,
     ) -> BoxFuture<'e, Result<Option<SqliteRow>, Error>>
     where
         'p: 'e,
@@ -510,28 +392,7 @@ impl<'p> Executor<'p> for &SqliteRwPool {
         'q: 'e,
         E: 'q,
     {
-        let pool = self.clone();
-
-        Box::pin(async move {
-            let arguments = query.take_arguments().map_err(Error::Encode)?;
-            let persistent = query.persistent();
-            let sql = query.sql();
-
-            let use_reader = pool.auto_route && is_read_only_sql(sql.as_str());
-            let target_pool = if use_reader {
-                &pool.read_pool
-            } else {
-                &pool.write_pool
-            };
-            let mut conn = target_pool.acquire().await?;
-
-            let routed = RoutedQuery {
-                sql,
-                arguments,
-                persistent,
-            };
-            conn.fetch_optional(routed).await
-        })
+        (&self.write_pool).fetch_optional(query)
     }
 
     fn prepare_with<'e>(
@@ -542,9 +403,7 @@ impl<'p> Executor<'p> for &SqliteRwPool {
     where
         'p: 'e,
     {
-        let pool = self.write_pool.clone();
-
-        Box::pin(async move { pool.acquire().await?.prepare_with(sql, parameters).await })
+        (&self.write_pool).prepare_with(sql, parameters)
     }
 
     #[doc(hidden)]
@@ -556,9 +415,7 @@ impl<'p> Executor<'p> for &SqliteRwPool {
     where
         'p: 'e,
     {
-        let pool = self.write_pool.clone();
-
-        Box::pin(async move { pool.acquire().await?.describe(sql).await })
+        (&self.write_pool).describe(sql)
     }
 }
 
@@ -588,130 +445,3 @@ impl<'a> Acquire<'a> for &SqliteRwPool {
     }
 }
 
-// ─── Tests ─────────────────────────────────────────────────────────────────────
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    // SELECT variants
-    #[test]
-    fn select_is_read_only() {
-        assert!(is_read_only_sql("SELECT * FROM users"));
-        assert!(is_read_only_sql("select * from users"));
-        assert!(is_read_only_sql("Select 1"));
-        assert!(is_read_only_sql("  SELECT 1"));
-        assert!(is_read_only_sql("\n\tSELECT 1"));
-        assert!(is_read_only_sql(
-            "SELECT count(*) FROM orders WHERE status = 'active'"
-        ));
-    }
-
-    // EXPLAIN
-    #[test]
-    fn explain_is_read_only() {
-        assert!(is_read_only_sql("EXPLAIN SELECT 1"));
-        assert!(is_read_only_sql("EXPLAIN QUERY PLAN SELECT * FROM users"));
-        assert!(is_read_only_sql("explain query plan select 1"));
-    }
-
-    // PRAGMA
-    #[test]
-    fn pragma_routing() {
-        // Read-only PRAGMAs (no =)
-        assert!(is_read_only_sql("PRAGMA journal_mode"));
-        assert!(is_read_only_sql("PRAGMA table_info(users)"));
-        assert!(is_read_only_sql("pragma page_count"));
-
-        // Write PRAGMAs (with =)
-        assert!(!is_read_only_sql("PRAGMA journal_mode = WAL"));
-        assert!(!is_read_only_sql("PRAGMA synchronous = NORMAL"));
-    }
-
-    // WITH CTEs
-    #[test]
-    fn with_cte_routing() {
-        // Read-only CTEs
-        assert!(is_read_only_sql("WITH t AS (SELECT 1) SELECT * FROM t"));
-        assert!(is_read_only_sql(
-            "WITH RECURSIVE cte(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cte WHERE n < 10) SELECT * FROM cte"
-        ));
-
-        // Write CTEs
-        assert!(!is_read_only_sql(
-            "WITH t AS (SELECT 1) INSERT INTO foo SELECT * FROM t"
-        ));
-        assert!(!is_read_only_sql(
-            "WITH t AS (SELECT 1) UPDATE foo SET bar = 1"
-        ));
-        assert!(!is_read_only_sql("WITH t AS (SELECT 1) DELETE FROM foo"));
-        assert!(!is_read_only_sql(
-            "WITH t AS (SELECT 1) REPLACE INTO foo SELECT * FROM t"
-        ));
-    }
-
-    // Write operations → writer
-    #[test]
-    fn write_operations_are_not_read_only() {
-        assert!(!is_read_only_sql("INSERT INTO users VALUES (1)"));
-        assert!(!is_read_only_sql("UPDATE users SET name = 'Bob'"));
-        assert!(!is_read_only_sql("DELETE FROM users"));
-        assert!(!is_read_only_sql("REPLACE INTO users VALUES (1)"));
-        assert!(!is_read_only_sql("CREATE TABLE foo (id INT)"));
-        assert!(!is_read_only_sql("DROP TABLE foo"));
-        assert!(!is_read_only_sql("ALTER TABLE foo ADD COLUMN bar INT"));
-        assert!(!is_read_only_sql("CREATE INDEX idx ON foo(bar)"));
-    }
-
-    // Transaction control → writer
-    #[test]
-    fn transaction_control_is_not_read_only() {
-        assert!(!is_read_only_sql("BEGIN"));
-        assert!(!is_read_only_sql("BEGIN TRANSACTION"));
-        assert!(!is_read_only_sql("COMMIT"));
-        assert!(!is_read_only_sql("ROLLBACK"));
-        assert!(!is_read_only_sql("SAVEPOINT sp1"));
-    }
-
-    // Edge cases
-    #[test]
-    fn edge_cases() {
-        // Empty / whitespace
-        assert!(!is_read_only_sql(""));
-        assert!(!is_read_only_sql("   "));
-
-        // Keywords as substrings should NOT match
-        assert!(!is_read_only_sql("SELECTIVITY_CHECK()"));
-
-        // ATTACH / DETACH → writer
-        assert!(!is_read_only_sql("ATTACH DATABASE ':memory:' AS db2"));
-        assert!(!is_read_only_sql("DETACH DATABASE db2"));
-
-        // False negative: write keyword in string literal → safely routes to writer
-        assert!(!is_read_only_sql(
-            "WITH t AS (SELECT 'DELETE') SELECT * FROM t"
-        ));
-    }
-
-    // Word boundary checks
-    #[test]
-    fn word_boundary_checks() {
-        // "SELECTED" should not match "SELECT"
-        assert!(!is_read_only_sql("SELECTED * FROM foo"));
-
-        // "SELECTS" should not match "SELECT"
-        assert!(!is_read_only_sql("SELECTS something"));
-
-        // "INSERTS" in a WITH should not trigger the INSERT guard
-        // (but it also won't match as a standalone keyword)
-        assert!(is_read_only_sql(
-            "WITH t AS (SELECT * FROM inserts_log) SELECT * FROM t"
-        ));
-
-        // "UPDATE" as a column name in a table won't match because
-        // it would need word boundaries
-        assert!(is_read_only_sql(
-            "WITH t AS (SELECT updated FROM foo) SELECT * FROM t"
-        ));
-    }
-}

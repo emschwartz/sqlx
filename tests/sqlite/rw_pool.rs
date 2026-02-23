@@ -28,42 +28,6 @@ async fn rw_pool_connect_and_close() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ─── Auto-routing: SELECT goes to reader, INSERT goes to writer ────────────────
-
-#[sqlx_macros::test]
-async fn rw_pool_auto_routes_queries() -> anyhow::Result<()> {
-    let (opts, _dir) = temp_db_opts();
-    let pool = SqliteRwPool::connect_with(opts).await?;
-
-    // Create table via writer (auto-routed)
-    sqlx::query("CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT NOT NULL)")
-        .execute(&pool)
-        .await?;
-
-    // INSERT via writer (auto-routed)
-    sqlx::query("INSERT INTO users (name) VALUES (?)")
-        .bind("Alice")
-        .execute(&pool)
-        .await?;
-
-    sqlx::query("INSERT INTO users (name) VALUES (?)")
-        .bind("Bob")
-        .execute(&pool)
-        .await?;
-
-    // SELECT via reader (auto-routed)
-    let rows = sqlx::query("SELECT name FROM users ORDER BY name")
-        .fetch_all(&pool)
-        .await?;
-
-    assert_eq!(rows.len(), 2);
-    assert_eq!(rows[0].get::<String, _>("name"), "Alice");
-    assert_eq!(rows[1].get::<String, _>("name"), "Bob");
-
-    pool.close().await;
-    Ok(())
-}
-
 // ─── Transactions always use writer ────────────────────────────────────────────
 
 #[sqlx_macros::test]
@@ -199,83 +163,6 @@ async fn rw_pool_reader_rejects_writes() -> anyhow::Result<()> {
     Ok(())
 }
 
-// ─── PRAGMA routing ────────────────────────────────────────────────────────────
-
-#[sqlx_macros::test]
-async fn rw_pool_pragma_routing() -> anyhow::Result<()> {
-    let (opts, _dir) = temp_db_opts();
-    let pool = SqliteRwPool::connect_with(opts).await?;
-
-    // Read-only PRAGMA (no =) should succeed (routes to reader)
-    let row = sqlx::query("PRAGMA journal_mode").fetch_one(&pool).await?;
-    let mode = row.get::<String, _>(0);
-    assert_eq!(mode.to_lowercase(), "wal");
-
-    pool.close().await;
-    Ok(())
-}
-
-// ─── WITH CTE routing ──────────────────────────────────────────────────────────
-
-#[sqlx_macros::test]
-async fn rw_pool_with_cte_routing() -> anyhow::Result<()> {
-    let (opts, _dir) = temp_db_opts();
-    let pool = SqliteRwPool::connect_with(opts).await?;
-
-    sqlx::query("CREATE TABLE cte_test (id INTEGER PRIMARY KEY, val INTEGER)")
-        .execute(&pool)
-        .await?;
-    sqlx::query("INSERT INTO cte_test (val) VALUES (10), (20), (30)")
-        .execute(&pool)
-        .await?;
-
-    // Read-only WITH CTE → reader
-    let rows = sqlx::query("WITH t AS (SELECT val FROM cte_test WHERE val > 10) SELECT * FROM t")
-        .fetch_all(&pool)
-        .await?;
-    assert_eq!(rows.len(), 2);
-
-    pool.close().await;
-    Ok(())
-}
-
-// ─── Auto-route disabled ───────────────────────────────────────────────────────
-
-#[sqlx_macros::test]
-async fn rw_pool_auto_route_disabled() -> anyhow::Result<()> {
-    let (opts, _dir) = temp_db_opts();
-    let pool = SqliteRwPoolOptions::new()
-        .auto_route(false)
-        .max_readers(2)
-        .connect_with(opts)
-        .await?;
-
-    // Even SELECTs go to writer when auto_route is disabled
-    sqlx::query("CREATE TABLE no_route (id INTEGER PRIMARY KEY)")
-        .execute(&pool)
-        .await?;
-
-    sqlx::query("INSERT INTO no_route (id) VALUES (1)")
-        .execute(&pool)
-        .await?;
-
-    let row = sqlx::query("SELECT id FROM no_route")
-        .fetch_one(&pool)
-        .await?;
-    assert_eq!(row.get::<i32, _>("id"), 1);
-
-    // Explicit reader still works
-    let mut reader = pool.acquire_reader().await?;
-    let rows = sqlx::query("SELECT id FROM no_route")
-        .fetch_all(&mut *reader)
-        .await?;
-    assert_eq!(rows.len(), 1);
-
-    drop(reader);
-    pool.close().await;
-    Ok(())
-}
-
 // ─── Concurrent reads don't block ──────────────────────────────────────────────
 
 #[sqlx_macros::test]
@@ -287,23 +174,23 @@ async fn rw_pool_concurrent_reads() -> anyhow::Result<()> {
         .await?;
 
     sqlx::query("CREATE TABLE conc (id INTEGER PRIMARY KEY, val TEXT)")
-        .execute(&pool)
+        .execute(pool.writer())
         .await?;
 
     for i in 0..10 {
         sqlx::query("INSERT INTO conc (val) VALUES (?)")
             .bind(format!("item_{i}"))
-            .execute(&pool)
+            .execute(pool.writer())
             .await?;
     }
 
-    // Spawn multiple concurrent reads
+    // Spawn multiple concurrent reads via explicit reader pool
     let mut handles = Vec::new();
     for _ in 0..4 {
-        let pool = pool.clone();
+        let reader = pool.reader().clone();
         handles.push(sqlx_core::rt::spawn(async move {
             let rows = sqlx::query("SELECT count(*) as cnt FROM conc")
-                .fetch_one(&pool)
+                .fetch_one(&reader)
                 .await
                 .unwrap();
             rows.get::<i64, _>("cnt")
