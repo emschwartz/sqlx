@@ -202,7 +202,7 @@ impl SqliteRwPoolOptions {
         base_options: SqliteConnectOptions,
     ) -> Result<SqliteRwPool, Error> {
         let num_cpus = std::thread::available_parallelism()
-            .map(|n| n.get() as u32)
+            .map(|n| u32::try_from(n.get()).unwrap_or(u32::MAX))
             .unwrap_or(4);
 
         // Configure writer: WAL mode + synchronous(Normal)
@@ -219,20 +219,20 @@ impl SqliteRwPoolOptions {
         // WAL mode is active on the database file; readers inherit it automatically.
         let reader_opts = self
             .reader_connect_options
-            .unwrap_or_else(|| base_options)
+            .unwrap_or(base_options)
             .read_only(true);
 
         // Writer pool: always exactly 1 connection
         let writer_pool_opts = self
             .writer_pool_options
-            .unwrap_or_else(PoolOptions::new)
+            .unwrap_or_default()
             .max_connections(1);
 
         // Reader pool: configurable, defaults to num_cpus
         let max_readers = self.max_readers.unwrap_or(num_cpus);
         let reader_pool_opts = self
             .reader_pool_options
-            .unwrap_or_else(PoolOptions::new)
+            .unwrap_or_default()
             .max_connections(max_readers);
 
         // Create writer pool FIRST — establishes WAL mode on the database file
