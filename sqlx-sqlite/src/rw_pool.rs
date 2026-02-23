@@ -1,5 +1,7 @@
 use crate::options::{SqliteJournalMode, SqliteSynchronous};
-use crate::{Sqlite, SqliteConnectOptions, SqliteQueryResult, SqliteRow, SqliteStatement, SqliteTypeInfo};
+use crate::{
+    Sqlite, SqliteConnectOptions, SqliteQueryResult, SqliteRow, SqliteStatement, SqliteTypeInfo,
+};
 
 use sqlx_core::acquire::Acquire;
 use sqlx_core::error::{BoxDynError, Error};
@@ -388,11 +390,7 @@ impl SqliteRwPool {
         if self.checkpoint_on_close && !self.write_pool.is_closed() {
             if let Ok(mut conn) = self.write_pool.acquire().await {
                 // Best-effort WAL checkpoint
-                let _ = Executor::execute(
-                    &mut *conn,
-                    "PRAGMA wal_checkpoint(PASSIVE)",
-                )
-                .await;
+                let _ = Executor::execute(&mut *conn, "PRAGMA wal_checkpoint(PASSIVE)").await;
             }
         }
 
@@ -458,9 +456,7 @@ impl Execute<'_, Sqlite> for RoutedQuery {
         None
     }
 
-    fn take_arguments(
-        &mut self,
-    ) -> Result<Option<crate::SqliteArguments>, BoxDynError> {
+    fn take_arguments(&mut self) -> Result<Option<crate::SqliteArguments>, BoxDynError> {
         Ok(self.arguments.take())
     }
 
@@ -522,10 +518,18 @@ impl<'p> Executor<'p> for &SqliteRwPool {
             let sql = query.sql();
 
             let use_reader = pool.auto_route && is_read_only_sql(sql.as_str());
-            let target_pool = if use_reader { &pool.read_pool } else { &pool.write_pool };
+            let target_pool = if use_reader {
+                &pool.read_pool
+            } else {
+                &pool.write_pool
+            };
             let mut conn = target_pool.acquire().await?;
 
-            let routed = RoutedQuery { sql, arguments, persistent };
+            let routed = RoutedQuery {
+                sql,
+                arguments,
+                persistent,
+            };
             conn.fetch_optional(routed).await
         })
     }
@@ -598,7 +602,9 @@ mod tests {
         assert!(is_read_only_sql("Select 1"));
         assert!(is_read_only_sql("  SELECT 1"));
         assert!(is_read_only_sql("\n\tSELECT 1"));
-        assert!(is_read_only_sql("SELECT count(*) FROM orders WHERE status = 'active'"));
+        assert!(is_read_only_sql(
+            "SELECT count(*) FROM orders WHERE status = 'active'"
+        ));
     }
 
     // EXPLAIN
@@ -626,9 +632,7 @@ mod tests {
     #[test]
     fn with_cte_routing() {
         // Read-only CTEs
-        assert!(is_read_only_sql(
-            "WITH t AS (SELECT 1) SELECT * FROM t"
-        ));
+        assert!(is_read_only_sql("WITH t AS (SELECT 1) SELECT * FROM t"));
         assert!(is_read_only_sql(
             "WITH RECURSIVE cte(n) AS (SELECT 1 UNION ALL SELECT n+1 FROM cte WHERE n < 10) SELECT * FROM cte"
         ));
@@ -640,9 +644,7 @@ mod tests {
         assert!(!is_read_only_sql(
             "WITH t AS (SELECT 1) UPDATE foo SET bar = 1"
         ));
-        assert!(!is_read_only_sql(
-            "WITH t AS (SELECT 1) DELETE FROM foo"
-        ));
+        assert!(!is_read_only_sql("WITH t AS (SELECT 1) DELETE FROM foo"));
         assert!(!is_read_only_sql(
             "WITH t AS (SELECT 1) REPLACE INTO foo SELECT * FROM t"
         ));

@@ -230,10 +230,9 @@ async fn rw_pool_with_cte_routing() -> anyhow::Result<()> {
         .await?;
 
     // Read-only WITH CTE → reader
-    let rows =
-        sqlx::query("WITH t AS (SELECT val FROM cte_test WHERE val > 10) SELECT * FROM t")
-            .fetch_all(&pool)
-            .await?;
+    let rows = sqlx::query("WITH t AS (SELECT val FROM cte_test WHERE val > 10) SELECT * FROM t")
+        .fetch_all(&pool)
+        .await?;
     assert_eq!(rows.len(), 2);
 
     pool.close().await;
