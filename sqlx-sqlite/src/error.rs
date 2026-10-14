@@ -7,7 +7,7 @@ use std::{borrow::Cow, str};
 use libsqlite3_sys::{
     sqlite3, sqlite3_errmsg, sqlite3_errstr, sqlite3_extended_errcode, SQLITE_CONSTRAINT_CHECK,
     SQLITE_CONSTRAINT_FOREIGNKEY, SQLITE_CONSTRAINT_NOTNULL, SQLITE_CONSTRAINT_PRIMARYKEY,
-    SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR, SQLITE_NOMEM,
+    SQLITE_CONSTRAINT_UNIQUE, SQLITE_ERROR,
 };
 
 pub(crate) use sqlx_core::error::*;
@@ -80,11 +80,6 @@ impl SqliteError {
             code: SQLITE_ERROR,
             message: message.into(),
         }
-    }
-
-    /// Return `SQLITE_NOMEM`.
-    pub(crate) fn nomem() -> Self {
-        Self::from_code(SQLITE_NOMEM)
     }
 }
 
